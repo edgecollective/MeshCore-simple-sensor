@@ -1,4 +1,5 @@
 #include <Arduino.h>   // needed for PlatformIO
+#include <Wire.h>      // TWI handle, so sleep can release the bus (SLEEP_RELEASE_TWI)
 #include <Mesh.h>
 
 #if defined(NRF52_PLATFORM)
@@ -16,11 +17,11 @@
 #include <RTClib.h>
 #include <target.h>
 
-extern RADIO_CLASS radio;   // RadioLib radio object (defined in target.cpp) -- for getDeviceErrors()
+extern RADIO_CLASS radio;   // RadioLib radio object (target.cpp) -- for getDeviceErrors()
 
 /* ---------------------------------- CONFIGURATION ------------------------------------- */
 
-#define FIRMWARE_VER_TEXT   "companion_sensor v3-ultrasonic (build: Jul 2026) [v3 + MaxBotix MB7388 → distance_meters] [DEBUG: link-health LED (send=toggle, ACK=off, timeout=on) + OLED tx/ack counters + display always-on]"
+#define FIRMWARE_VER_TEXT   "sonar_field_node (build: Jul 22 2026, v3.1 gateA fixes) [v3-ultrasonic + MaxBotix MB7388 -> distance_meters; duty-cycle mode machine; link-health LED (send=toggle, ACK=off, timeout=on, off on sleep) + STATUS tx-fail count]"
 
 #ifndef LORA_FREQ
   #define LORA_FREQ   910.525
@@ -86,6 +87,202 @@ enum DisplayPage {
 #define LONG_PRESS_MILLIS     1200
 #define ALERT_DURATION_MS     1500
 
+// MB7388 pin 4 (Ranging Start/Stop) wired to Arduino D1 = P0.06, reclaimed from
+// Serial1 TX (no TX wire needed). Commanded ranging: hold high to range, low to
+// stop. Serial1.begin() otherwise owns D1 as UART TXD idling HIGH -> the sensor
+// free-runs and backlogs unsolicited frames, so setup() detaches TXD via PSEL.
+#define PIN_STROBE   1
+#ifndef SONAR_SAMPLES
+#define SONAR_SAMPLES  7   // frames to collect per reading; median rejects surface chop
+#endif
+
+// --- power knobs, each separately measurable ------------------------------------
+// Default 0 so the default build stays exactly the configuration measured at
+// 1.066 mA on 2026-07-18. Each gets its own env so its effect is attributable
+// before it is adopted: measure first, then make it the default.
+//
+// PWR_ENABLE_DCDC: RookBoard derives from NRF52BoardDCDC, but RookBoard::begin()
+// calls NRF52Board::begin() -- the GRANDparent -- so NRF52BoardDCDC::begin() never
+// runs and the DC/DC enable is silently skipped. The board has been running on the
+// LDO. Enabling DC/DC on an nRF52840 typically saves 30-40% of supply current.
+// Done app-side rather than by patching Don's RookBoard.cpp; worth reporting
+// upstream as a board-support bug either way.
+#ifndef PWR_ENABLE_DCDC
+#define PWR_ENABLE_DCDC 0
+#endif
+
+// SLEEP_RELEASE_TWI: Wire.begin() runs once in RookBoard::begin() and is never
+// ended, so TWIM stays enabled across sleep. Same class of leak as the UART.
+#ifndef SLEEP_RELEASE_TWI
+#define SLEEP_RELEASE_TWI 0
+#endif
+
+// Compile knob for the attribution A/B. 1 (default) releases UARTE0 across sleep;
+// 0 leaves it enabled the way the pre-2026-07-18 firmware did, which is what the
+// measured 6.6 mA floor came from. Build the paired env to reproduce that arm
+// rather than passing an ephemeral -D, so the comparison stays replicable.
+#ifndef SLEEP_RELEASE_UART
+#define SLEEP_RELEASE_UART 1
+#endif
+
+// SLEEP_PIN_DISCONNECT_AUDIT: during sleep, put the explicitly listed non-radio
+// pins into the nRF52's buffer-disconnected reset state (PIN_CNF INPUT=Disconnect
+// via nrf_gpio_cfg_default) instead of whatever floating/input state the sleep
+// path leaves them in. pinMode(INPUT) keeps the input buffer connected, and a
+// floating buffer near threshold conducts. Restore contract: each pin's own
+// bring-up in MODE_WAKE rewrites its PIN_CNF (sonar_serial_begin -> strobe
+// OUTPUT + Serial1 RX; Wire.begin -> SDA/SCL), so no explicit reconnect step
+// exists to forget. The list is closed-form on purpose -- only pins whose wake
+// path provably reconfigures them. Sonar gate (D5/P0.24) stays a driven OUTPUT.
+#ifndef SLEEP_PIN_DISCONNECT_AUDIT
+#define SLEEP_PIN_DISCONNECT_AUDIT 0
+#endif
+
+// SLEEP_DISABLE_USBD: turn the USB peripheral off during battery sleep.
+//
+// The Adafruit core calls TinyUSB_Device_Init unconditionally, so USBD stays
+// enabled on battery with no host attached. An enabled USBD holds the HFCLK and
+// is the classic signature of a ~1 mA nRF52840 sleep floor. Only fires when
+// USBREGSTATUS reports no VBUS, so every USB-attached bench flow is untouched.
+// One-way on battery: replugging USB later needs a reset to re-enumerate --
+// acceptable for a field node, and stated wherever this knob gets adopted.
+#ifndef SLEEP_DISABLE_USBD
+#define SLEEP_DISABLE_USBD 0
+#endif
+
+// SLEEP_FPU_CLEAR: apply the nRF52840 Errata-87 workaround before each sleep
+// poll. Float math latches an FPSCR exception bit which keeps the FPU IRQ
+// pending; a pending IRQ makes WFE fall straight through, so the FreeRTOS idle
+// task spins instead of sleeping. QT1 (2026-07-20) measured fpu_pend=1 at
+// every sleep entry on this firmware, so this is live, not theoretical.
+#ifndef SLEEP_FPU_CLEAR
+#define SLEEP_FPU_CLEAR 0
+#endif
+
+// --- bisection strip knobs (cumulative, app layer only) ---
+// Each STRIP_* removes one stack layer so adjacent JS220 floors attribute its
+// cost. Ladder: S1 display -> S2 sonar -> S3 filesystem -> S4 mesh (radio goes
+// RadioLib-direct: init then immediate warm sleep; loop is a bare heartbeat).
+// All default 0 -- the deployment build is untouched.
+#ifndef STRIP_DISPLAY
+#define STRIP_DISPLAY 0
+#endif
+#ifndef STRIP_SONAR
+#define STRIP_SONAR 0
+#endif
+#ifndef STRIP_FS
+#define STRIP_FS 0
+#endif
+#ifndef STRIP_MESH
+#define STRIP_MESH 0
+#endif
+// HEARTBEAT: '[HB] <millis>' each sleep poll -- the alive-check for stripped
+// arms that cannot TX/ACK.
+#ifndef HEARTBEAT
+#define HEARTBEAT 0
+#endif
+
+#if STRIP_DISPLAY
+// turnOn() re-inits the panel (SSD1306Display.cpp:24), so a begin() guard alone
+// is not enough -- stub the on/off calls at their sites.
+#define DISPLAY_TURN_ON()  ((void)0)
+#define DISPLAY_TURN_OFF() ((void)0)
+#else
+#define DISPLAY_TURN_ON()  display.turnOn()
+#define DISPLAY_TURN_OFF() display.turnOff()
+#endif
+
+// SLEEP_HFCLK_STOP: stop the HFXO during battery sleep. QT1 showed the 64 MHz
+// crystal RUNNING through sleep; disabling USBD alone did not release it.
+// Suspected mechanism: the node always boots on USB, the USB bring-up requests
+// HFCLK, and nothing releases the request when VBUS goes away mid-run -- the
+// release rides a power event no task processes on battery. Rather than chase
+// the requester, stop the clock at sleep entry when VBUS is absent. Peripherals
+// that need HF later fall back to HFINT on demand; the SX1262 runs its own
+// TCXO and does not care about the MCU crystal.
+#ifndef SLEEP_HFCLK_STOP
+#define SLEEP_HFCLK_STOP 0
+#endif
+
+// SLEEP_DIAG: print the power-relevant machine state at each sleep entry
+// (SoftDevice enabled? USBD enabled? HFCLK source+state? FPU IRQ pending?
+// RXEN/NSS levels). Costs a few ms of serial once per cycle; bench-only knob.
+#ifndef SLEEP_DIAG
+#define SLEEP_DIAG 0
+#endif
+
+#if SLEEP_DIAG
+static void sleep_diag_dump() {
+  // Boot-entry guard: the mode machine STARTS in MODE_SLEEP, so this runs in the
+  // first instants of boot -- and reading USBD registers before the USB power
+  // domain finishes sequencing bus-faults the core (node dies before CDC ever
+  // enumerates; cost us three invisible flashes). Skip the boot entry; the
+  // first informative dump is after a real wake/TX cycle anyway. Same reason
+  // there is no sd_softdevice_is_enabled() SVC here.
+  static bool first_entry = true;
+  if (first_entry) { first_entry = false; return; }
+  Serial.print("[DIAG] usbd_en="); Serial.print(NRF_USBD->ENABLE);
+  Serial.print(" vbus="); Serial.print((NRF_POWER->USBREGSTATUS & 1) ? 1 : 0);
+  Serial.print(" hfclkstat=0x"); Serial.print(NRF_CLOCK->HFCLKSTAT, HEX);
+  Serial.print(" fpu_pend="); Serial.print(NVIC_GetPendingIRQ(FPU_IRQn));
+  Serial.print(" rxen="); Serial.print(digitalRead(SX126X_RXEN));
+  Serial.print(" nss="); Serial.println(digitalRead(P_LORA_NSS));
+}
+#endif
+
+#if SLEEP_PIN_DISCONNECT_AUDIT
+#include "nrf_gpio.h"
+static void sleep_pins_disconnect() {
+  nrf_gpio_cfg_default(g_ADigitalPinMap[PIN_STROBE]);       // D1/P0.06: sonar_serial_end left it INPUT (buffer on)
+  nrf_gpio_cfg_default(g_ADigitalPinMap[PIN_SERIAL1_RX]);   // D0/P0.08: sonar RX pad after UARTE release
+#if SLEEP_RELEASE_TWI
+  nrf_gpio_cfg_default(g_ADigitalPinMap[PIN_WIRE_SDA]);     // I2C pads only when TWIM is truly ended
+  nrf_gpio_cfg_default(g_ADigitalPinMap[PIN_WIRE_SCL]);
+#endif
+}
+#endif
+
+// --- sonar serial lifecycle (deep-idle support) --------------------------------
+// UARTE0 is a power domain of its own: left enabled it holds the HFCLK running and
+// costs on the order of a milliamp even with no traffic, which puts a floor under
+// any System-ON idle. So the sleep path must DISABLE it, not merely stop reading.
+//
+// Every Serial1.begin() re-attaches UARTE TXD to D1, so the PSEL detach has to be
+// re-applied here on each bring-up or the sensor free-runs and backlogs unsolicited
+// frames (an earlier bug). Keeping both halves in one place is what stops the
+// wake path from silently forgetting it.
+static void sonar_serial_begin() {
+#if STRIP_SONAR
+  return;                              // bisection arm: sonar layer removed
+#endif
+  Serial1.begin(ULTRASONIC_BAUD);
+  NRF_UARTE0->PSEL.TXD = 0xFFFFFFFF;   // reclaim D1 from UART TX -> GPIO strobe
+  pinMode(PIN_STROBE, OUTPUT);
+  digitalWrite(PIN_STROBE, LOW);       // ranging stopped until a read commands it
+}
+
+// Release UARTE0 and both sonar pads. Called BEFORE gating the sensor off: an
+// active UART RX pad sneak-loads the MB7388's output while its ground floats,
+// which is the loading path chased earlier.
+static void sonar_serial_end() {
+#if STRIP_SONAR
+  return;                              // bisection arm: sonar layer removed
+#endif
+  Serial1.end();
+  NRF_UARTE0->ENABLE = 0;              // ensure the peripheral is truly off, not idle
+  pinMode(PIN_STROBE, INPUT);          // hi-Z: never drive into an unpowered sensor
+}
+
+// median of the first n ints in a[] (n small; insertion sort in place)
+static int median_int(int *a, int n) {
+  for (int i = 1; i < n; i++) {
+    int v = a[i], j = i - 1;
+    while (j >= 0 && a[j] > v) { a[j + 1] = a[j]; j--; }
+    a[j + 1] = v;
+  }
+  return a[n / 2];
+}
+
 // Believe it or not, this std C function is busted on some platforms!
 static uint32_t _atoi(const char* sp) {
   uint32_t n = 0;
@@ -101,7 +298,7 @@ static uint32_t _atoi(const char* sp) {
 // MaxBotix MB7388 sensor globals.
 // Reads ASCII frames of the form "Rxxxx\r" on Serial1 (9600 baud, TTL).
 // MB7388 free-runs at ~6 Hz when its pin 4 (RX/strobe) is left floating or HIGH.
-// xxxx is millimeters; range 300 mm – 5000 mm. 0 / out-of-range readings are
+// xxxx is millimeters; range 300 mm - 5000 mm. 0 / out-of-range readings are
 // reported by the sensor itself (e.g. "R5000" for max-out).
 static bool has_sensor = false;
 static unsigned long sensor_last_frame_at = 0;
@@ -151,22 +348,21 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
   uint32_t last_ack_rt_ms;            // round-trip ms of the most recent ACK (serial log only)
   unsigned long last_ack_at_millis;   // millis() when the most recent OK ACK arrived
 
-  // debug: lifetime counters surfaced on the OLED. packets_tx = sensor packets
-  // handed to the radio; packets_ack = ACKs matched back. Watching the gap (and
-  // whether tx keeps climbing) makes the one-and-done wedge visible at a glance.
-  uint32_t packets_tx;
-  uint32_t packets_ack;
-
-  // debug: link-health LED state. Three rules drive it: a send TOGGLES it
-  // (packet in flight), a positive ACK forces it OFF (healthy), a timeout forces
-  // it ON (problem). Net: healthy link rests dark with a brief per-cycle ON
-  // pulse; a failing link sits lit with a short OFF blink at each resend.
+  // link-health LED (P0.15). Rules: a send TOGGLES it (packet in flight), a
+  // positive ACK forces it OFF (healthy), a timeout forces it ON (problem). The
+  // mode machine forces it OFF on MODE_SLEEP entry so a fully-failed transmit
+  // never leaves the lamp lit into sleep (power).
   bool led_on;
   void ledWrite(bool on) {
     led_on = on;
     digitalWrite(LED_PIN, (on == (LED_STATE_ON != 0)) ? HIGH : LOW);
   }
   void ledToggle() { ledWrite(!led_on); }
+
+  // last-transmit outcome, surfaced on the STATUS page. Set by the mode machine
+  // when a MODE_TRANSMIT sequence ends: failed=true means all attempts missed.
+  bool last_tx_failed;
+  uint8_t last_tx_attempts;           // sends attempted in that last transmit
 
   void loadContacts() {
     if (_fs->exists("/contacts")) {
@@ -400,13 +596,21 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
   // We loop until ULTRASONIC_READ_TIMEOUT_MS elapses to make sure the value
   // we return is the freshest one in the buffer.
   float readDistanceMeters() {
-    int last_mm = -1;
+    // Commanded ranging: flush, strobe pin4 high, collect up to SONAR_SAMPLES
+    // "Rdddd\r" frames, strobe low, return their median (mm -> m). Commanding
+    // the strobe (vs floating pin4) is what keeps the MB7388 from free-running
+    // and backlogging unsolicited frames when Serial1 shares the pin.
+    while (Serial1.available()) Serial1.read();          // drop stale frames
+    digitalWrite(PIN_STROBE, HIGH);                       // pin4 high -> ranging
+
+    int samp[SONAR_SAMPLES];
+    int ns = 0;
     char digits[8];
     int di = 0;
     bool capturing = false;
-
-    unsigned long start = millis();
-    while ((millis() - start) < ULTRASONIC_READ_TIMEOUT_MS) {
+    // ~6 Hz frames, so give ~200 ms each plus a settle margin
+    unsigned long deadline = millis() + (unsigned long)SONAR_SAMPLES * 200UL + 300UL;
+    while (ns < SONAR_SAMPLES && (long)(deadline - millis()) > 0) {
       while (Serial1.available()) {
         char c = (char)Serial1.read();
         if (c == 'R') {
@@ -416,8 +620,9 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
           if (c == '\r') {
             digits[di] = 0;
             if (di >= 3) {  // accept 3 or 4 digit frames
-              last_mm = atoi(digits);
+              samp[ns++] = atoi(digits);
               sensor_last_frame_at = millis();
+              if (ns >= SONAR_SAMPLES) break;
             }
             capturing = false;
             di = 0;
@@ -429,14 +634,16 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
           }
         }
       }
-      delay(5);
+      delay(2);
     }
 
-    if (last_mm < 0) {
+    digitalWrite(PIN_STROBE, LOW);                        // pin4 low -> stop ranging
+
+    if (ns == 0) {
       Serial.println("   MaxBotix: no frame within timeout");
       return -1.0f;
     }
-    return (float)last_mm / 1000.0f;
+    return (float)median_int(samp, ns) / 1000.0f;
   }
 
   float readBatteryVoltage() {
@@ -464,14 +671,19 @@ public:
   int sendSensorReading() {
     last_send_successes = 0;
     last_send_attempts = 0;
-    uint16_t err_before = radio.getDeviceErrors();
+    // Decisive probe: clear the fault register, read it back (0x0000 => clear
+    // works; still 0x0020 => the XOSC fault re-latches instantly = persistent),
+    // then read again after the TX (0x0020 => the transmit itself re-faults it).
+    radio.clearDeviceErrors();
+    uint16_t err_cleared = radio.getDeviceErrors();
 
     if (target_count == 0) {
       Serial.println("   No targets set, skipping send (use 'target add <name>')");
       return 0;
     }
 
-    updateSensorReadings();
+    // reading was cached in MODE_MEASURE; re-reading here finds the sonar
+    // already gated off and clobbers has_sensor with a false failure
 
     for (uint8_t i = 0; i < target_count; i++) {
       last_send_attempts++;
@@ -495,7 +707,7 @@ public:
         StrHelper::strncpy(path_str, "none", sizeof(path_str));
       } else {
         size_t off = 0;
-        // Cap at what fits in 47 chars: 15 hops × "xx." = 45 chars + "xx" = 47. Path_len max
+        // Cap at what fits in 47 chars: 15 hops x "xx." = 45 chars + "xx" = 47. Path_len max
         // is 64 but in practice routes are short; we truncate defensively.
         uint8_t to_write = recipient->out_path_len;
         if (to_write > 15) to_write = 15;
@@ -526,10 +738,9 @@ public:
         Serial.print(") ");
       }
 
-      // debug: toggle the LED the instant BEFORE we hit the radio (packet in
-      // flight). processAck() will drive it OFF on a good ACK, onSendTimeout()
-      // ON on a miss. If the SX1262 wedges inside the send, the LED will have
-      // toggled but no "sent" line prints and packets_tx won't advance.
+      // link-health LED: toggle the instant before every radio send (attempt 1
+      // and each retry). processAck() drives it OFF on a good ACK, onSendTimeout()
+      // ON on a miss; the mode machine forces it OFF entering sleep.
       ledToggle();
 
       uint32_t est_timeout;
@@ -542,14 +753,13 @@ public:
         last_ack_status = ACK_STATUS_PENDING;
         Serial.println(result == MSG_SEND_SENT_FLOOD ? "sent (FLOOD)" : "sent (DIRECT)");
         last_send_successes++;
-        packets_tx++;  // debug: count packets the radio actually accepted
       }
     }
 
     Serial.printf("   (%d/%d sent)\n", last_send_successes, last_send_attempts);
-    // Probe the SX1262's own fault register around the transmit. 0x0000 = clean;
-    // bits flip if the TX surge wedged it: 0x20=XOSC_START 0x40=PLL_LOCK 0x100=PA_RAMP.
-    Serial.printf("   [RADIO_ERR] before=0x%04X after=0x%04X\n", err_before, radio.getDeviceErrors());
+    // 0x20=XOSC_START 0x40=PLL_LOCK 0x100=PA_RAMP. cleared = state right after a
+    // clear (before TX); after_tx = state once the transmit finished.
+    Serial.printf("   [RADIO_ERR] cleared=0x%04X after_tx=0x%04X\n", err_cleared, radio.getDeviceErrors());
     return last_send_successes;
   }
 
@@ -573,8 +783,12 @@ public:
   AckStatus getLastAckStatus() const { return last_ack_status; }
   uint32_t getLastAckRoundTripMs() const { return last_ack_rt_ms; }
   unsigned long getLastAckAtMillis() const { return last_ack_at_millis; }
-  uint32_t getPacketsTx() const { return packets_tx; }
-  uint32_t getPacketsAck() const { return packets_ack; }
+
+  // link-health LED + last-transmit outcome, driven by the mode machine.
+  void linkLedOff() { ledWrite(false); }   // force dark (power) on sleep entry
+  void recordTxOutcome(bool failed, uint8_t attempts) { last_tx_failed = failed; last_tx_attempts = attempts; }
+  bool getLastTxFailed() const { return last_tx_failed; }
+  uint8_t getLastTxAttempts() const { return last_tx_attempts; }
 
   // Read the sensor + battery and cache the values WITHOUT sending -- used by
   // the OLED's Send page so the user can see a fresh reading before deciding
@@ -656,8 +870,7 @@ protected:
       last_ack_rt_ms = _ms->getMillis() - last_msg_sent;
       last_ack_at_millis = millis();
       last_ack_status = ACK_STATUS_OK;
-      packets_ack++;  // debug: count matched ACKs for the OLED tx/ack line
-      ledWrite(false);  // debug: good ACK -> LED OFF (link healthy)
+      ledWrite(false);  // good ACK -> LED OFF (link healthy)
       Serial.printf("   Got ACK! (round trip: %lu millis)\n", (unsigned long)last_ack_rt_ms);
       expected_ack_crc = 0;
       return NULL;
@@ -701,7 +914,7 @@ protected:
     // the path we just learned from the receiver's PATH-return.
     if (expected_ack_crc == 0) return;
     last_ack_status = ACK_STATUS_TIMEOUT;
-    ledWrite(true);  // debug: no ACK -> LED ON (link problem); next resend blinks it off
+    ledWrite(true);  // no ACK -> LED ON (problem); next resend toggles it briefly off
 
     // v2: on timeout, invalidate the cached out_path for the most recent target.
     // The NEXT scheduled send will flood, which forces a fresh path discovery on
@@ -739,9 +952,9 @@ public:
     last_ack_status = ACK_STATUS_NONE;
     last_ack_rt_ms = 0;
     last_ack_at_millis = 0;
-    packets_tx = 0;
-    packets_ack = 0;
     led_on = false;
+    last_tx_failed = false;
+    last_tx_attempts = 0;
     node_id = 1;
   }
 
@@ -880,15 +1093,6 @@ public:
     } else if (strcmp(command, "send") == 0) {
       Serial.println("   Sending sensor reading now...");
       sendSensorReading();
-    } else if (memcmp(command, "gate", 4) == 0) {
-      // Coupling probe: D5/GPS_EN is the low-side sonar gate (Q2). Toggle it
-      // live and watch the radio -- 'gate on' should break ACKs, 'gate off' should
-      // restore them (or not, if the disturbance latches). Characterizes the
-      // GPS_EN -> radio-RX coupling with the radio otherwise fully working.
-      const char* a = command + 4; while (*a == ' ') a++;
-      if (strcmp(a, "on") == 0)       { digitalWrite(5, HIGH); Serial.println("   GATE D5/GPS_EN = ON"); }
-      else if (strcmp(a, "off") == 0) { digitalWrite(5, LOW);  Serial.println("   GATE D5/GPS_EN = OFF"); }
-      else Serial.printf("   GATE D5/GPS_EN = %s\n", digitalRead(5) ? "ON" : "OFF");
     } else if (memcmp(command, "list", 4) == 0) {
       int n = 0;
       if (command[4] == ' ') {
@@ -930,6 +1134,9 @@ public:
       importCard(&command[7]);
     } else if (strcmp(command, "advert") == 0) {
       sendAdvert();
+    } else if (strcmp(command, "radio") == 0) {
+      Serial.printf("[RADIO] freq=%.3f MHz  bw=%.1f kHz  sf=%d  cr=4/%d  txpwr=%d\n",
+                    (double)LORA_FREQ, (double)LORA_BW, (int)LORA_SF, (int)LORA_CR, (int)LORA_TX_POWER);
     } else if (memcmp(command, "set ", 4) == 0) {
       const char* config = &command[4];
       if (memcmp(config, "name ", 5) == 0) {
@@ -986,26 +1193,10 @@ public:
   void loop() {
     BaseChatMesh::loop();
 
-    // Check if it's time to send a sensor reading
-#ifdef SEND_TIMER_MILLIS
-    // millis()-based gate: direct test of whether the RTC clock (getCurrentTime)
-    // fails to advance without GPS/NTP, capping repeat sends at one boot packet.
-    static unsigned long last_send_ms = 0;
-    if (last_send_ms == 0 || (millis() - last_send_ms) >= (unsigned long)send_interval_secs * 1000UL) {
-      updateSensorReadings();
-      Serial.printf("[SENSOR] node_id=%u dist=%.3fm batt=%.2fV\n", (unsigned)node_id, last_dist_m, last_batt);
-      sendSensorReading();
-      last_send_ms = millis();
-    }
-#else
-    uint32_t now = getRTCClock()->getCurrentTime();
-    if (now > 0 && (last_send_time == 0 || (now - last_send_time) >= send_interval_secs)) {
-      updateSensorReadings();
-      Serial.printf("[SENSOR] node_id=%u dist=%.3fm batt=%.2fV\n", (unsigned)node_id, last_dist_m, last_batt);
-      sendSensorReading();
-      last_send_time = now;
-    }
-#endif
+    // NOTE: the field-node mode machine (MODE_TRANSMIT) is the SOLE transmit
+    // authority now -- the old interval auto-send is removed so a send can never
+    // fire outside the duty cycle (e.g. during SLEEP). We still call this loop()
+    // for BaseChatMesh radio/ACK servicing and the serial command console below.
 
     // Serial command handling
     int len = strlen(command);
@@ -1065,13 +1256,19 @@ static void drawPageDots(DisplayDriver& d) {
   }
 }
 
+static bool g_demo_banner = false;   // DEMO renders the status page; banner tells them apart
+
 static void renderStatusPage(DisplayDriver& d) {
   d.setTextSize(1);
   d.setColor(DisplayDriver::LIGHT);
 
-  // Node name and ID
+  // Node name and ID (DEMO banner in demo mode so the pages are tellable apart)
   char buf[32];
-  snprintf(buf, sizeof(buf), "%s [%u]", the_mesh.getNodeName(), (unsigned)the_mesh.getNodeId());
+  if (g_demo_banner) {
+    snprintf(buf, sizeof(buf), "** DEMO ** [%u]", (unsigned)the_mesh.getNodeId());
+  } else {
+    snprintf(buf, sizeof(buf), "%s [%u]", the_mesh.getNodeName(), (unsigned)the_mesh.getNodeId());
+  }
   d.setCursor(0, 10);
   d.print(buf);
 
@@ -1110,35 +1307,38 @@ static void renderStatusPage(DisplayDriver& d) {
   d.setCursor(0, 46);
   d.print(buf);
 
-  // debug: transmit/ack counters + a short last-ACK freshness token, all on the
-  // bottom line so a wedge reads at a glance. T = packets handed to the radio,
-  // A = ACKs matched back. The one-and-done signature is T frozen at 1 with A=0.
-  char ack_tok[10];
-  switch (the_mesh.getLastAckStatus()) {
-    case ACK_STATUS_OK: {
-      unsigned long age_s = (millis() - the_mesh.getLastAckAtMillis()) / 1000UL;
-      if (age_s < 60) {
-        snprintf(ack_tok, sizeof(ack_tok), "%lus", age_s);
-      } else if (age_s < 3600) {
-        snprintf(ack_tok, sizeof(ack_tok), "%lum", age_s / 60);
-      } else {
-        snprintf(ack_tok, sizeof(ack_tok), "%luh", age_s / 3600);
+  // Bottom line: if the last deploy transmit failed every attempt, show that as
+  // an error with the try count (the installer's "is this node getting through?"
+  // check). Otherwise the usual last-ACK-age / interval feedback.
+  if (the_mesh.getLastTxFailed()) {
+    snprintf(buf, sizeof(buf), "ERR: no ACK x%d", (int)the_mesh.getLastTxAttempts());
+  } else {
+    switch (the_mesh.getLastAckStatus()) {
+      case ACK_STATUS_OK: {
+        unsigned long age_ms = millis() - the_mesh.getLastAckAtMillis();
+        unsigned long age_s = age_ms / 1000UL;
+        if (age_s < 60) {
+          snprintf(buf, sizeof(buf), "Last: ACK %lus ago", age_s);
+        } else if (age_s < 3600) {
+          snprintf(buf, sizeof(buf), "Last: ACK %lum ago", age_s / 60);
+        } else if (age_s < 86400) {
+          snprintf(buf, sizeof(buf), "Last: ACK %luh ago", age_s / 3600);
+        } else {
+          snprintf(buf, sizeof(buf), "Last: ACK %lud ago", age_s / 86400);
+        }
+        break;
       }
-      break;
+      case ACK_STATUS_PENDING:
+        snprintf(buf, sizeof(buf), "Last: sending...");
+        break;
+      case ACK_STATUS_TIMEOUT:
+        snprintf(buf, sizeof(buf), "Last: no ACK");
+        break;
+      default:
+        snprintf(buf, sizeof(buf), "Every %ds", (int)the_mesh.getSendInterval());
+        break;
     }
-    case ACK_STATUS_PENDING:
-      StrHelper::strncpy(ack_tok, "pend", sizeof(ack_tok));
-      break;
-    case ACK_STATUS_TIMEOUT:
-      StrHelper::strncpy(ack_tok, "noack", sizeof(ack_tok));
-      break;
-    default:
-      StrHelper::strncpy(ack_tok, "--", sizeof(ack_tok));
-      break;
   }
-  snprintf(buf, sizeof(buf), "T:%lu A:%lu %s",
-           (unsigned long)the_mesh.getPacketsTx(),
-           (unsigned long)the_mesh.getPacketsAck(), ack_tok);
   d.setCursor(0, 56);
   d.print(buf);
 }
@@ -1211,7 +1411,7 @@ static void handleButtonEvents() {
   // Any button press turns display on and resets auto-off timer
   last_button_activity = millis();
   if (!display.isOn()) {
-    display.turnOn();
+    DISPLAY_TURN_ON();
     next_display_refresh = 0;  // force immediate refresh
     return;  // consume this press just to turn on the screen
   }
@@ -1233,11 +1433,11 @@ static void handleButtonEvents() {
       uint8_t succ = the_mesh.getLastSendSuccesses();
       uint8_t att = the_mesh.getLastSendAttempts();
       if (att == 0) {
-        // No `target add …` has been done yet -- make this very explicit.
+        // No `target add ...` has been done yet -- make this very explicit.
         showAlert("Target not set");
       } else {
-        // Switch to status page so the user can watch the "Last: …" line cycle
-        // through sending → ACK Nms / no ACK. Overlay a brief alert as immediate
+        // Switch to status page so the user can watch the "Last: ..." line cycle
+        // through sending -> ACK Nms / no ACK. Overlay a brief alert as immediate
         // confirmation that the long-press registered.
         current_page = PAGE_STATUS;
         next_display_refresh = 0;
@@ -1264,16 +1464,309 @@ static void displayLoop() {
   handleButtonEvents();
   renderDisplay();
 
-  // debug: auto-off is DISABLED for this build so the tx/ack counters stay
-  // visible across the room during a link watch. (Production sonar_field_node
-  // keeps its own sleep/blank logic; this is the always-on bench node.)
-  // Auto-off after inactivity -- intentionally left off:
-  // if (display.isOn() && last_button_activity > 0 &&
-  //     (millis() - last_button_activity) > DISPLAY_AUTO_OFF_MS) {
-  //   display.turnOff();
-  // }
+  // Auto-off after inactivity
+  if (display.isOn() && last_button_activity > 0 &&
+      (millis() - last_button_activity) > DISPLAY_AUTO_OFF_MS) {
+    DISPLAY_TURN_OFF();
+  }
 }
 #endif  // DISPLAY_CLASS
+
+/* ============================ FIELD-NODE MODE MACHINE ============================ */
+// Duty-cycle deployment layer over the companion_sensor mesh node. The pure
+// transition logic lives in modes.h (host-tested, 29 checks); this wires each
+// mode to the sonar gate, OLED, and mesh transmit/ACK path. Defaults to the
+// low-power deploy cycle; the dev views (STATUS/DEMO/TX_DEBUG) are opt-in via B1.
+#include "modes.h"
+#include "radio_lowpower.h"   // app-side radio SPI-sleep/wake (MeshCore left pristine)
+
+#define PIN_SONAR_GATE     5          // D5 = GPS_EN = AO3400 low-side gate (HIGH = sonar powered)
+#ifndef CYCLE_SECS
+#define CYCLE_SECS         300        // deploy measure/transmit cadence (5 min); -D override for bench
+#endif
+#ifndef STATUS_SECS
+#define STATUS_SECS        30         // MODE_STATUS dwell on the OLED; -D override for bench
+#endif
+#define DEMO_SECS          CYCLE_SECS // MODE_DEMO runs one cycle then lapses back to sleep
+#define TX_RETRY_MS        5000       // wait this long for an ACK before a retry
+#define TX_MAX_ATTEMPTS    5          // give up after this many sends
+#define WAKE_SETTLE_MS     300        // sonar power-up settle on a plain (timer) wake
+// MODE_SLEEP idle granularity: delay() WFE-sleeps the CPU this long between
+// cadence/button re-checks. At 50 ms the core is woken 20x per second purely to
+// re-read a clock and a pin, and each wake costs. Overridable so the wake rate can
+// be measured as its own variable: the arithmetic (147 uA System-OFF vs ~1066 uA
+// System-ON) says the remaining floor is idle overhead, not a peripheral.
+// Cost of raising it: button-press latency during sleep, and cadence granularity -
+// both irrelevant against a 20 s bench or 300 s deployment cycle.
+#ifndef SLEEP_POLL_MS
+#define SLEEP_POLL_MS      50
+#endif
+#define GESTURE_WINDOW_MS  1500       // bounded button-classify cap in WAKE (> long-press 1200ms)
+#ifndef SONAR_QUIET_MS
+#define SONAR_QUIET_MS     2000       // let the gated sonar fully spin down before TX (RX desense fix)
+#endif
+
+static mode g_mode = MODE_POST;
+static unsigned long g_mode_since = 0;   // millis() at mode entry
+static bool g_woke_by_button = false;    // how SLEEP was interrupted (button vs RTC)
+static int  g_tx_attempts = 0;
+static unsigned long g_tx_sent_at = 0;
+static unsigned long g_txdbg_settled_at = 0;
+#define TXDBG_LINGER_MS 3000
+
+static void sonar_power(bool on) {
+#if STRIP_SONAR
+  (void)on; return;                    // bisection arm: sonar layer removed
+#endif
+#ifdef SONAR_FORCE_OFF
+  (void)on;
+  digitalWrite(PIN_SONAR_GATE, LOW);   // TEST: sonar forced OFF to isolate whether its
+                                       // gated power/RF noise desenses the radio RX
+#else
+  digitalWrite(PIN_SONAR_GATE, on ? HIGH : LOW);
+#endif
+}
+
+// draw the shared status page (sensor / battery / target / ACK age) in its own frame
+static void render_status_frame() {
+  if (!display.isOn()) return;
+  display.startFrame();
+  renderStatusPage(display);
+  display.endFrame();
+}
+
+static void render_post() {
+  if (!display.isOn()) return;
+  display.startFrame();
+  display.setCursor(0, 0);  display.print("POST self-test");
+  display.setCursor(0, 16); display.print(has_sensor ? "sonar: OK" : "sonar: --");
+  display.setCursor(0, 28); display.print("radio: OK");
+  display.endFrame();
+}
+
+static void render_tx_debug() {
+  if (!display.isOn()) return;
+  char line[40];
+  const char* as = "-";
+  switch (the_mesh.getLastAckStatus()) {
+    case ACK_STATUS_PENDING: as = "pending"; break;
+    case ACK_STATUS_OK:      as = "ACK OK";  break;
+    case ACK_STATUS_TIMEOUT: as = "TIMEOUT"; break;
+    default: break;
+  }
+  display.startFrame();
+  display.setCursor(0, 0);  display.print("TX DEBUG");
+  snprintf(line, sizeof(line), "dist %.2fm", last_dist_m); display.setCursor(0, 14); display.print(line);
+  snprintf(line, sizeof(line), "batt %.2fV", last_batt);   display.setCursor(0, 26); display.print(line);
+  snprintf(line, sizeof(line), "ack %s rt%lu", as, (unsigned long)the_mesh.getLastAckRoundTripMs());
+  display.setCursor(0, 38); display.print(line);
+  snprintf(line, sizeof(line), "try %d/%d", g_tx_attempts, TX_MAX_ATTEMPTS);
+  display.setCursor(0, 50); display.print(line);
+  display.endFrame();
+}
+
+// entry actions: run once when a mode becomes current.
+static void enter_mode(mode m) {
+  Serial.printf("[MODE] %s -> %s\n", mode_name(g_mode), mode_name(m));   // serial trace for bench HIL
+  g_mode = m;
+  g_mode_since = millis();
+
+  switch (m) {
+    case MODE_POST:
+      DISPLAY_TURN_ON();
+      break;
+    case MODE_STATUS:
+#if SLEEP_RELEASE_TWI
+      Wire.begin();                  // direct hop from SLEEP: bus up before the panel
+#endif
+      g_demo_banner = false;
+      DISPLAY_TURN_ON();
+      break;
+    case MODE_SLEEP:
+      DISPLAY_TURN_OFF();
+#if SLEEP_RELEASE_UART
+      sonar_serial_end();            // release UARTE0 + both pads BEFORE gating: an enabled
+                                     // UARTE holds HFCLK (~mA) and an active RX pad loads the
+                                     // sensor output while its ground floats. Measured
+                                     // 2026-07-18: this is worth ~5.5 mA of sleep floor.
+#endif
+      sonar_power(false);            // gate cuts sonar draw
+      NRF_P1->LATCH = (1u << 0);     // stale press latched while awake must not rewake us
+      the_mesh.linkLedOff();         // force the lamp dark for sleep, even after a fully-failed transmit
+      radio_sleep_lp();              // SPI-sleep the radio (~1uA); loop() then skips the_mesh.loop() while slept
+#if SLEEP_RELEASE_TWI
+      Wire.end();                    // TWIM is another always-enabled HFCLK holder; the
+                                     // display is already off, so the bus has no user here
+#endif
+#if SLEEP_PIN_DISCONNECT_AUDIT
+      sleep_pins_disconnect();       // LAST: after every release above, silence the listed
+                                     // pads (buffer-disconnected). Wake bring-up rewrites
+                                     // each pin's PIN_CNF, so there is no restore to forget.
+#endif
+#if SLEEP_DIAG
+      sleep_diag_dump();             // state snapshot AFTER all releases, before the idle loop
+#endif
+#if SLEEP_DISABLE_USBD
+      if (!(NRF_POWER->USBREGSTATUS & POWER_USBREGSTATUS_VBUSDETECT_Msk)) {
+        NRF_USBD->ENABLE = 0;        // battery only: drop USBD so it stops holding HFCLK.
+                                     // One-way until reset; VBUS-present skips this entirely.
+      }
+#endif
+#if SLEEP_HFCLK_STOP
+      if (!(NRF_POWER->USBREGSTATUS & POWER_USBREGSTATUS_VBUSDETECT_Msk)) {
+        NRF_CLOCK->TASKS_HFCLKSTOP = 1;   // battery only: release the latched HFXO.
+                                          // HF users fall back to HFINT on demand.
+      }
+#endif
+      break;
+    case MODE_WAKE:
+#if SLEEP_RELEASE_TWI
+      Wire.begin();                  // bus back up before anything talks to the display
+#endif
+      radio_wake_lp();               // wake radio + re-arm Rx before measure/transmit; un-pauses the mesh
+      sonar_power(true);
+#if SLEEP_RELEASE_UART
+      sonar_serial_begin();          // UARTE0 back up, D1 reclaimed as the pin-4 strobe.
+                                     // Paired with the sleep-side release: if we did not
+                                     // release, we must not re-begin.
+#endif
+      break;
+    case MODE_MEASURE:
+      break;
+    case MODE_TRANSMIT:
+      DISPLAY_TURN_OFF();
+      sonar_power(false);            // sonar off for the TX/ACK window: its gated power/RF
+                                     // noise desenses the radio RX (bench-confirmed). The
+                                     // reading was already cached in MODE_MEASURE.
+      delay(SONAR_QUIET_MS);         // let the MaxBotix fully spin down (its bulk caps keep
+                                     // it emitting after the gate cuts) before the radio TX
+      g_tx_attempts = 1;
+      the_mesh.sendSensorReading();
+      g_tx_sent_at = millis();
+      break;
+    case MODE_DEMO:
+      g_demo_banner = true;
+      DISPLAY_TURN_ON();
+      sonar_power(true);
+#if SLEEP_RELEASE_UART
+      sonar_serial_begin();          // STATUS gateway: UARTE may still be released
+#endif
+      break;
+    case MODE_TRANSMIT_DEBUG:
+      DISPLAY_TURN_ON();
+      radio_wake_lp();               // STATUS gateway: radio may still be slept
+      g_txdbg_settled_at = 0;
+      g_tx_attempts = 1;
+      the_mesh.sendSensorReading();
+      g_tx_sent_at = millis();
+      break;
+    default:
+      break;
+  }
+}
+
+// per-tick driver: build the event for the current mode, run its continuous
+// action, then advance the state machine via the pure next_mode().
+static void mode_loop() {
+  int btn = user_btn.check();               // classifies CLICK/DOUBLE/LONG when ready
+  unsigned long in_mode = millis() - g_mode_since;
+
+  mode_event me;
+  me.btn = btn;
+  me.elapsed = false;
+  me.done = false;
+  me.woke_by_button = g_woke_by_button;
+
+  switch (g_mode) {
+    case MODE_POST:
+      render_post();
+      me.done = (in_mode > 3000);           // self-test banner, long enough to read
+      break;
+    case MODE_STATUS:
+      render_status_frame();
+      me.elapsed = (in_mode > STATUS_SECS * 1000UL);
+      break;
+    case MODE_SLEEP:
+      // Display off + sonar gated off. CPU idle via FreeRTOS delay(): vTaskDelay
+      // blocks this task so the core WFE-sleeps in the idle task, and the RTC-
+      // driven RTOS tick reliably resumes us to re-check the cadence + button.
+      // (A raw waitForEvent() here hung on battery -- with USB, CDC interrupts were
+      // masking it by waking WFE; the JS220 caught the stuck node. delay() is the
+      // FreeRTOS-correct low-power idle.) Stage 2: radio.sleep() for the ~147uA
+      // floor per the sleep_test derisking; radio still RX-listening here (~8mA floor).
+#if SLEEP_FPU_CLEAR
+      // Errata 87: a float op latches the FPU exception -> FPU IRQ pending ->
+      // WFE returns immediately and the idle task spins instead of sleeping.
+      // QT1 measured fpu_pend=1 at sleep entry on this firmware. Clear the
+      // FPSCR exception bits and the pending IRQ before each idle interval.
+      __set_FPSCR(__get_FPSCR() & ~(0x0000009FUL));
+      (void) __get_FPSCR();
+      NVIC_ClearPendingIRQ(FPU_IRQn);
+#endif
+      delay(SLEEP_POLL_MS);
+      if (in_mode > CYCLE_SECS * 1000UL) { g_woke_by_button = false; me.elapsed = true; }
+      else if (btn != BUTTON_EVENT_NONE || user_btn.isPressed() ||
+               (NRF_P1->LATCH & (1u << 0))) {
+        NRF_P1->LATCH = (1u << 0);   // consume the hardware-latched edge
+        g_woke_by_button = true;
+      }
+      me.woke_by_button = g_woke_by_button;
+      break;
+    case MODE_WAKE:
+      if (g_woke_by_button) {
+        if (in_mode > GESTURE_WINDOW_MS) me.done = true;   // spurious wake -> measure anyway
+      } else {
+        me.done = (in_mode > WAKE_SETTLE_MS);              // timer wake: settle then measure
+      }
+      break;
+    case MODE_MEASURE:
+      the_mesh.refreshReading();            // sonar + battery into cache (blocks ~read timeout)
+      me.done = true;
+      break;
+    case MODE_TRANSMIT: {
+      // Retry only after the FULL TX_RETRY_MS. The mesh flags its own send-timeout
+      // in <1s, but the real ACK round-trip is ~2.7s -- retrying on the mesh flag
+      // would re-send before the ACK can arrive (retry < RTT) and never catch it.
+      // expected_ack_crc stays set across the wait, so a late ACK still lands.
+      AckStatus s = the_mesh.getLastAckStatus();
+      if (s == ACK_STATUS_OK) {
+        the_mesh.recordTxOutcome(false, g_tx_attempts);        // acked (took g_tx_attempts tries)
+        me.done = true;
+      } else if ((millis() - g_tx_sent_at) > TX_RETRY_MS) {
+        if (g_tx_attempts >= TX_MAX_ATTEMPTS) {
+          the_mesh.recordTxOutcome(true, g_tx_attempts);       // all attempts missed -> STATUS shows error
+          me.done = true;                                      // exhausted -> back to sleep (LED forced off there)
+        } else {
+          g_tx_attempts++; the_mesh.sendSensorReading(); g_tx_sent_at = millis();
+        }
+      }
+      break;
+    }
+    case MODE_DEMO:
+      the_mesh.refreshReading();
+      render_status_frame();
+      me.elapsed = (in_mode > DEMO_SECS * 1000UL);
+      break;
+    case MODE_TRANSMIT_DEBUG: {
+      render_tx_debug();
+      AckStatus s = the_mesh.getLastAckStatus();
+      bool settled = (s == ACK_STATUS_OK || s == ACK_STATUS_TIMEOUT ||
+                      (millis() - g_tx_sent_at) > TX_RETRY_MS);
+      if (settled && g_txdbg_settled_at == 0) g_txdbg_settled_at = millis();
+      if (settled && (millis() - g_txdbg_settled_at) > TXDBG_LINGER_MS)
+        me.done = true;   // linger so the outcome is readable before leaving
+      break;
+    }
+    default:
+      break;
+  }
+
+  mode next = next_mode(g_mode, me);
+  if (next != g_mode) {
+    if (g_mode == MODE_SLEEP || g_mode == MODE_WAKE) g_woke_by_button = false;   // wake consumed on SLEEP exit
+    enter_mode(next);
+  }
+}
 
 /* ---------------------------------- SETUP & LOOP -------------------------------------- */
 
@@ -1292,34 +1785,79 @@ void setup() {
   Serial.println("================================================");
   Serial.println("setup: Serial up.");
 
-  // debug: onboard LED is our hardware TX heartbeat (P0.15, active-high). We
-  // toggle it just before every radio send so a transmit attempt is visible
-  // even if the USB console/OLED freezes -- a frozen LED == a stalled TX path.
+  // link-health LED (P0.15, active-high): start dark. Toggled per send, ACK->off,
+  // timeout->on, forced off on sleep entry (see MyMesh + the mode machine).
   pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LED_STATE_ON ? LOW : HIGH);  // start off
-
-  // Probe: D5/GPS_EN = sonar low-side gate (Q2). Start OFF (radio clean);
-  // toggle live via the 'gate on|off' serial command to watch the coupling.
-  pinMode(5, OUTPUT);
-  digitalWrite(5, LOW);
+  digitalWrite(LED_PIN, LED_STATE_ON ? LOW : HIGH);
 
   Serial.println("setup: board.begin()...");
   board.begin();
+
+#if PWR_ENABLE_DCDC
+  // RookBoard::begin() calls NRF52Board::begin(), skipping NRF52BoardDCDC::begin(),
+  // so the DC/DC enable never fires and the board runs on the LDO. Do it here
+  // rather than patching Don's board file. Must come AFTER board.begin(), which is
+  // where the SoftDevice comes up.
+  {
+    uint8_t sd_enabled = 0;
+    sd_softdevice_is_enabled(&sd_enabled);
+    if (sd_enabled) {
+      sd_power_dcdc_mode_set(NRF_POWER_DCDC_ENABLE);
+    } else {
+      NRF_POWER->DCDCEN = 1;
+    }
+    Serial.println("setup: DC/DC regulator ENABLED (PWR_ENABLE_DCDC=1)");
+  }
+#endif
+
+  // Bring the radio up with the sonar gate OFF. The Rook's SX1262 runs on a TCXO;
+  // switching the gated sonar rail (AO3400 on pin 5) on during radio_init sags the
+  // supply right as the TCXO starts -> XOSC_START_ERR (0x0020) and an off-frequency
+  // radio that can't ACK. Order matters: radio first, sonar second. (HW backstop:
+  // bulk decoupling on the sonar rail is the follow-up.)
+  pinMode(PIN_SONAR_GATE, OUTPUT);
+  sonar_power(false);              // keep sonar off through radio startup
+
+  // Without begin() the nRF pin's input buffer stays disconnected and
+  // digitalRead never sees the button, no matter what the pad does.
+  user_btn.begin();
+  // Polled sampling misses taps that start and end between polls. SENSE-low
+  // makes the port's LATCH register catch the falling edge in hardware (async,
+  // no clock, no interrupt); the sleep poll reads and clears it. Same SENSE
+  // machinery a future System-OFF button-wake needs.
+  NRF_P1->PIN_CNF[0] |= (GPIO_PIN_CNF_SENSE_Low << GPIO_PIN_CNF_SENSE_Pos);
+  NRF_P1->LATCH = (1u << 0);
 
   Serial.println("setup: radio_init()...");
   if (!radio_init()) {
     Serial.println("setup: radio_init() FAILED -- halting.");
     halt();
   }
-  Serial.println("setup: radio OK.");
+  delay(20);                       // let the TCXO fully settle before trusting it
+  radio.clearDeviceErrors();       // clear any startup XOSC/cal latch now that it's stable
+  Serial.printf("setup: radio OK. [RADIO_ERR post-init=0x%04X]\n", radio.getDeviceErrors());
 
   fast_rng.begin(radio_get_rng_seed());
 
+#if STRIP_MESH
+  // S3+: no mesh, no cadence -- the arm is a bare sleep floor. Warm-sleep the
+  // radio right after init (the v4 pattern) and let the stripped loop() idle.
+  radio_sleep_lp();
+  Serial.println("setup: STRIP_MESH -- radio warm-slept, entering bare idle loop.");
+#endif
+
+#if !STRIP_SONAR
+  // radio is up and stable -- now power the sonar for the MaxBotix probe + cycles
+  sonar_power(true);
+
   // Initialize MaxBotix MB7388 (TTL serial, 9600 baud, "Rxxxx\r" frames).
   // Wire the MaxBotix pin 5 (serial TX) to the Rook's Serial1 RX pin; no TX
-  // wire back is needed. Power: 3.0–5.5 V on pin 6, ground on pin 7.
+  // wire back is needed. Power: 3.0-5.5 V on pin 6, ground on pin 7.
   Serial.println("setup: probing MaxBotix on Serial1 @ 9600 baud...");
-  Serial1.begin(ULTRASONIC_BAUD);
+  // Brings up UARTE0 and reclaims D1 from Serial1's TXD so pin 4 is a GPIO strobe
+  // (else it idles HIGH and the sensor free-runs). Same helper the wake path uses.
+  sonar_serial_begin();
+  digitalWrite(PIN_STROBE, HIGH);   // range during the probe window
   // Give the sensor up to ~500 ms to emit a first frame so we can flag
   // has_sensor on the OLED. has_sensor will be re-asserted on every successful
   // updateSensorReadings() anyway.
@@ -1347,9 +1885,11 @@ void setup() {
       has_sensor = false;
       Serial.println("No MaxBotix frames on Serial1 (check wiring / 9600 baud).");
     }
+    digitalWrite(PIN_STROBE, LOW);   // stop ranging; cycles command it per reading
   }
+#endif  /* !STRIP_SONAR */
 
-#ifdef DISPLAY_CLASS
+#if defined(DISPLAY_CLASS) && !STRIP_DISPLAY
   if (display.begin()) {
     display.startFrame();
     display.setCursor(0, 0);
@@ -1358,24 +1898,37 @@ void setup() {
   }
 #endif
 
+#if STRIP_FS && !STRIP_MESH
+#error "STRIP_FS requires STRIP_MESH: the_mesh.begin() needs the filesystem"
+#endif
+#if !STRIP_FS
   Serial.println("setup: filesystem.begin()...");
 #if defined(NRF52_PLATFORM)
   InternalFS.begin();
-  Serial.println("setup: the_mesh.begin() -- if first-boot, will block here on 'Press ENTER to generate key:'");
-  the_mesh.begin(InternalFS);
 #elif defined(RP2040_PLATFORM)
   LittleFS.begin();
-  the_mesh.begin(LittleFS);
 #elif defined(ESP32)
   SPIFFS.begin(true);
-  the_mesh.begin(SPIFFS);
 #else
   #error "need to define filesystem"
+#endif
+#endif  /* !STRIP_FS */
+
+#if !STRIP_MESH
+  Serial.println("setup: the_mesh.begin() -- if first-boot, will block here on 'Press ENTER to generate key:'");
+#if defined(NRF52_PLATFORM)
+  the_mesh.begin(InternalFS);
+#elif defined(RP2040_PLATFORM)
+  the_mesh.begin(LittleFS);
+#elif defined(ESP32)
+  the_mesh.begin(SPIFFS);
 #endif
   Serial.println("setup: mesh ready.");
 
   radio_set_params(LORA_FREQ, LORA_BW, LORA_SF, LORA_CR);
   radio_set_tx_power(LORA_TX_POWER);
+  Serial.printf("[RADIO] freq=%.3f MHz  bw=%.1f kHz  sf=%d  cr=4/%d  txpwr=%d\n",
+                (double)LORA_FREQ, (double)LORA_BW, (int)LORA_SF, (int)LORA_CR, (int)LORA_TX_POWER);
 
   the_mesh.showWelcome();
   Serial.println("setup: done, entering loop().");
@@ -1388,12 +1941,32 @@ void setup() {
 #if ENABLE_ADVERT_ON_BOOT == 1
   the_mesh.sendSelfAdvert(1200);
 #endif
+
+  // hand control to the field-node mode machine: reset always enters POST.
+  enter_mode(MODE_POST);
+#endif  /* !STRIP_MESH */
 }
 
 void loop() {
-  the_mesh.loop();
-#ifdef DISPLAY_CLASS
-  displayLoop();
+#if STRIP_MESH
+  // Bare bisection idle: radio already warm-slept in setup, no mesh, no mode
+  // machine. Same per-poll sleep actions the deployment MODE_SLEEP applies.
+#if HEARTBEAT
+  Serial.print("[HB] "); Serial.println(millis());
 #endif
+#if SLEEP_HFCLK_STOP
+  if (!(NRF_POWER->USBREGSTATUS & POWER_USBREGSTATUS_VBUSDETECT_Msk)) {
+    NRF_CLOCK->TASKS_HFCLKSTOP = 1;
+  }
+#endif
+  delay(SLEEP_POLL_MS);
+#else
+  // Pause the mesh while the radio is SPI-slept (MODE_SLEEP) -- servicing it would
+  // poll the slept radio over SPI and deadlock on BUSY. WAKE re-arms Rx before unpausing.
+  if (!g_radio_slept) {
+    the_mesh.loop();   // services the radio and fires processAck/onSendTimeout
+  }
   rtc_clock.tick();
+  mode_loop();         // field-node duty-cycle state machine (replaces displayLoop)
+#endif
 }

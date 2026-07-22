@@ -16,3 +16,8 @@ cmake-*
 compile_commands.json
 .venv/
 venv/
+
+# local working artifacts from the water-level node work
+*.c25bak
+*.bak
+scratch/

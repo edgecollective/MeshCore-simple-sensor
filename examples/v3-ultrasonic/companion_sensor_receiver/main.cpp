@@ -318,7 +318,7 @@ class ReceiverMesh : public BaseChatMesh, ContactVisitor {
         return true;
       }
     }
-    // Not a duplicate — record in round-robin slot.
+    // Not a duplicate -- record in round-robin slot.
     memcpy(dup_cache[dup_cache_next].sender_prefix, sender_pub, 4);
     dup_cache[dup_cache_next].sender_timestamp = sender_timestamp;
     dup_cache[dup_cache_next].seen_millis = now;
@@ -504,7 +504,7 @@ protected:
     if (is_duplicate && pkt->isRouteDirect()) {
       ContactInfo* c = lookupContactByPubKey(from.id.pub_key, PUB_KEY_SIZE);
       if (c && c->out_path_len != OUT_PATH_UNKNOWN) {
-        Serial.printf("   DUP: duplicate of recent direct msg from %s — invalidating reverse path "
+        Serial.printf("   DUP: duplicate of recent direct msg from %s -- invalidating reverse path "
                       "(was len=%d). ACK will FLOOD this time.\n",
                       from.name, (int)c->out_path_len);
         c->out_path_len = OUT_PATH_UNKNOWN;
@@ -1066,6 +1066,8 @@ void setup() {
 
   radio_set_params(LORA_FREQ, LORA_BW, LORA_SF, LORA_CR);
   radio_set_tx_power(LORA_TX_POWER);
+  Serial.printf("[RADIO] freq=%.3f MHz  bw=%.1f kHz  sf=%d  cr=4/%d  txpwr=%d\n",
+                (double)LORA_FREQ, (double)LORA_BW, (int)LORA_SF, (int)LORA_CR, (int)LORA_TX_POWER);
 
   the_mesh.beginWifi();
   the_mesh.showWelcome();
