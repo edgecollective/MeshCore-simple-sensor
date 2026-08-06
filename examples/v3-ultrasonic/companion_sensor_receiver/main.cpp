@@ -53,6 +53,14 @@
   #define BAYOU_BASE_URL "https://bayou.pvos.org/data/"
 #endif
 
+#ifndef BAYOU_DEFAULT_PUBLIC_KEY
+  #define BAYOU_DEFAULT_PUBLIC_KEY "mfupcqtx34ee"
+#endif
+
+#ifndef BAYOU_DEFAULT_PRIVATE_KEY
+  #define BAYOU_DEFAULT_PRIVATE_KEY "t3w7v5zpk8ya"
+#endif
+
 #include <helpers/BaseChatMesh.h>
 
 #define SEND_TIMEOUT_BASE_MILLIS          500
@@ -558,6 +566,8 @@ public:
     last_msg_sent = 0;
     memset(&_prefs, 0, sizeof(_prefs));
     StrHelper::strncpy(_prefs.node_name, ADVERT_NAME, sizeof(_prefs.node_name));
+    StrHelper::strncpy(_prefs.bayou_public_key,  BAYOU_DEFAULT_PUBLIC_KEY,  sizeof(_prefs.bayou_public_key));
+    StrHelper::strncpy(_prefs.bayou_private_key, BAYOU_DEFAULT_PRIVATE_KEY, sizeof(_prefs.bayou_private_key));
     has_recv = false;
     post_pending = false;
     next_post_retry_at = 0;

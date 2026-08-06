@@ -1245,7 +1245,11 @@ void setup() {
   // Wire the MaxBotix pin 5 (serial TX) to the Rook's Serial1 RX pin; no TX
   // wire back is needed. Power: 3.0–5.5 V on pin 6, ground on pin 7.
   Serial.println("setup: probing MaxBotix on Serial1 @ 9600 baud...");
+#if defined(ESP32) && defined(ULTRASONIC_RX_PIN)
+  Serial1.begin(ULTRASONIC_BAUD, SERIAL_8N1, ULTRASONIC_RX_PIN, -1);
+#else
   Serial1.begin(ULTRASONIC_BAUD);
+#endif
   // Give the sensor up to ~500 ms to emit a first frame so we can flag
   // has_sensor on the OLED. has_sensor will be re-asserted on every successful
   // updateSensorReadings() anyway.
