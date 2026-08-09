@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Posting sensor data to Bayou — a walkthrough</title>
+<style>
+  :root {
+    --fg:        #1a1a1a;
+    --fg-muted:  #555;
+    --bg:        #fdfdfd;
+    --bg-alt:    #f4f4f6;
+    --accent:    #1857b8;
+    --accent-2:  #b83a12;
+    --border:    #d8d8dd;
+    --code-bg:   #f4f4f6;
+    --code-fg:   #1a1a1a;
+    --box-bg:    #fff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg:       #ececec;
+      --fg-muted: #a0a0a8;
+      --bg:       #16171a;
+      --bg-alt:   #21232a;
+      --accent:   #7ba9ff;
+      --accent-2: #ff8b5c;
+      --border:   #33353d;
+      --code-bg:  #1c1e24;
+      --code-fg:  #ececec;
+      --box-bg:   #21232a;
+    }
+  }
+  html { background: var(--bg); color: var(--fg); }
+  body {
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, sans-serif;
+    max-width: 820px;
+    margin: 0 auto;
+    padding: 2rem 1.25rem 5rem;
+  }
+  h1 { font-size: 1.9rem; line-height: 1.15; margin: 0 0 .35rem; }
+  h2 {
+    font-size: 1.3rem; margin: 2.4rem 0 .5rem;
+    padding-bottom: .25rem; border-bottom: 1px solid var(--border);
+  }
+  h3 { font-size: 1.05rem; margin: 1.4rem 0 .35rem; }
+  p, ul, ol, table { margin: .55rem 0; }
+  a { color: var(--accent); }
+  code, pre {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+                 "Liberation Mono", monospace;
+  }
+  code { background: var(--code-bg); color: var(--code-fg);
+         padding: .08em .35em; border-radius: 3px; font-size: .92em; }
+  pre {
+    background: var(--code-bg); color: var(--code-fg);
+    padding: .85rem 1rem; overflow-x: auto; border-radius: 6px;
+    border: 1px solid var(--border); font-size: .88rem; line-height: 1.5;
+  }
+  pre code { background: none; padding: 0; font-size: 1em; }
+  .subtitle { color: var(--fg-muted); margin: 0 0 1.75rem; font-size: 1.02rem; }
+  .toc {
+    background: var(--bg-alt); border: 1px solid var(--border);
+    border-radius: 6px; padding: .8rem 1rem; margin: 1.25rem 0 2rem;
+    font-size: .92rem;
+  }
+  .toc ol { margin: .15rem 0 0 1.1rem; padding: 0; }
+  .toc li { margin: .12rem 0; }
+  table { width: 100%; border-collapse: collapse; font-size: .92rem; }
+  th, td { text-align: left; padding: .45rem .55rem;
+           border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { background: var(--bg-alt); font-weight: 600; }
+  tr:last-child td { border-bottom: none; }
+  .callout {
+    border-left: 3px solid var(--accent); background: var(--bg-alt);
+    padding: .6rem .9rem; margin: 1rem 0; border-radius: 0 4px 4px 0;
+    font-size: .95rem;
+  }
+  .callout.warn { border-left-color: var(--accent-2); }
+  .pipeline {
+    display: flex; flex-wrap: wrap; align-items: stretch; gap: .35rem;
+    margin: 1rem 0 1.5rem; font-size: .88rem;
+  }
+  .pipeline .step {
+    background: var(--box-bg); border: 1px solid var(--border);
+    border-radius: 6px; padding: .55rem .7rem; flex: 1 1 130px;
+    min-width: 130px;
+  }
+  .pipeline .step b { display: block; font-size: .95rem; }
+  .pipeline .step small { color: var(--fg-muted); }
+  .pipeline .arrow {
+    align-self: center; color: var(--fg-muted); font-size: 1.4rem;
+    line-height: 1;
+  }
+  .field-group {
+    display: inline-block; font-size: .82rem; padding: .1rem .5rem;
+    background: var(--bg-alt); border: 1px solid var(--border);
+    border-radius: 3px; color: var(--fg-muted); white-space: nowrap;
+  }
+  footer {
+    margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border);
+    color: var(--fg-muted); font-size: .88rem;
+  }
+</style>
+</head>
+<body>
+
+<h1>Posting sensor data to Bayou</h1>
+<p class="subtitle">
+  How a small ESP32 firmware — or a five-line Python script — pushes a
+  measurement to a Bayou feed, and what Bayou will do with each field.
+</p>
+
+<div class="toc">
+  <b>On this page</b>
+  <ol>
+    <li><a href="#pipeline">The end-to-end pipeline</a></li>
+    <li><a href="#micro">What the microcontroller does</a></li>
+    <li><a href="#feed">Bayou feeds: what the keys are for</a></li>
+    <li><a href="#fields">The allowed measurement fields</a></li>
+    <li><a href="#python">A Python script that mimics the sensor</a></li>
+    <li><a href="#walkthrough">End-to-end walkthrough</a></li>
+    <li><a href="#gotchas">Gotchas &amp; things Bayou does not do</a></li>
+  </ol>
+</div>
+
+<h2 id="pipeline">1. The end-to-end pipeline</h2>
+
+<p>
+  In the reference kit that this repo ships (<code>examples/v3-ultrasonic</code>),
+  a physical distance reading takes four hops to reach a browser chart:
+</p>
+
+<div class="pipeline">
+  <div class="step"><b>MaxBotix</b><small>ultrasonic sensor</small></div>
+  <div class="arrow">→</div>
+  <div class="step"><b>Rook sender</b><small>nRF52840 + LoRa</small></div>
+  <div class="arrow">→</div>
+  <div class="step"><b>Heltec receiver</b><small>ESP32-S3 + WiFi</small></div>
+  <div class="arrow">→</div>
+  <div class="step"><b>Bayou</b><small>Express + Postgres feed</small></div>
+</div>
+
+<p>
+  This page is about the last hop: the plain HTTP POST from the Heltec
+  receiver to Bayou. It's simple enough that anything that can make an HTTPS
+  request — a shell script, a Python script, a webhook, another
+  microcontroller — can play the role of "sensor" for a Bayou feed. The
+  Python script in section&nbsp;5 is a working example of exactly that.
+</p>
+
+<h2 id="micro">2. What the microcontroller does</h2>
+
+<p>
+  When the receiver gets a LoRa DM from the sender, it parses the distance and
+  battery voltage out of the payload, then builds a small JSON object and
+  POSTs it to Bayou. The relevant firmware is in
+  <code>examples/v3-ultrasonic/companion_sensor_receiver/main.cpp</code>,
+  function <code>postToBayou</code>. The request looks like this:
+</p>
+
+<pre><code>POST https://bayou.pvos.org/data/&lt;feed_public_key&gt;
+Content-Type: application/json
+
+{
+  "private_key":     "&lt;feed_private_key&gt;",
+  "node_id":         2,
+  "distance_meters": 1.723,
+  "battery_volts":   3.874,
+  "aux_1":           0,
+  "aux_2":           1,
+  "log":             "path=5a.91 route=DIRECT",
+  "source":          "Sensor"
+}</code></pre>
+
+<p>Two things about that body worth pausing on:</p>
+
+<ul>
+  <li>
+    <b>The URL only carries the public key.</b> The private key travels in
+    the JSON body, not the URL — that's how Bayou distinguishes "anyone who
+    knows the feed" from "someone allowed to write to it". More on this in
+    section&nbsp;3.
+  </li>
+  <li>
+    <b>Some fields are recognized, some aren't.</b> Bayou has a fixed set
+    of column names it knows about (section&nbsp;4). Every recognized field
+    goes into its own database column; every unrecognized field is
+    <i>silently ignored</i>. In the example above,
+    <code>distance_meters</code>, <code>battery_volts</code>, <code>node_id</code>,
+    <code>aux_1</code>, <code>aux_2</code>, and <code>log</code> are stored;
+    <code>source</code> is dropped on the floor because Bayou has no column
+    for it. The receiver sends it anyway because it costs nothing and reads
+    nicely in a packet capture.
+  </li>
+</ul>
+
+<p>
+  On a successful post Bayou answers <code>200 Measurement recorded</code>.
+  On a private-key mismatch it answers <code>400 Private key mismatch.</code>
+  A network error or unreachable server produces an HTTP client error, which
+  the receiver logs and retries after 15 seconds.
+</p>
+
+<h2 id="feed">3. Bayou feeds: what the keys are for</h2>
+
+<p>
+  A Bayou "feed" is just two 12-character IDs (nanoid, alphabet
+  <code>23456789abcdefghijkmnpqrstuvwxyz</code> — ambiguous characters
+  removed) plus a Postgres row backing it. There are no accounts, no logins,
+  and no email addresses; the two keys are the only access control.
+</p>
+
+<table>
+  <thead>
+    <tr><th style="width:9rem">Key</th><th>Where it appears</th><th>What it grants</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>public_key</code></td>
+      <td>In every URL of the feed
+        (<code>/data/&lt;public_key&gt;/…</code>) and on the feed page itself.
+        You can share it freely.</td>
+      <td><b>Read.</b> Anyone with the public key can view the chart, pull
+        the JSON, download the CSV, and see all fields you've posted.</td>
+    </tr>
+    <tr>
+      <td><code>private_key</code></td>
+      <td>Only in the body of write requests
+        (<code>{"private_key": "…"}</code>). Never in a URL, never on the
+        feed page.</td>
+      <td><b>Write.</b> Anyone with the private key can post new
+        measurements to the feed — or wipe the feed via
+        <code>/manage/clear/…</code>.</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+  To create a feed, either open the Bayou home page in a browser and click
+  through the create-feed form, or from a script:
+</p>
+
+<pre><code>curl -X POST https://bayou.pvos.org/manage/</code></pre>
+
+<p>
+  Either way, Bayou returns an HTML page showing the new feed's public key,
+  private key, feed URL, and a QR code. <b>Save the private key immediately</b> —
+  it's shown once and there is no recovery flow if you lose it.
+</p>
+
+<div class="callout warn">
+  <b>Destructive GET warning.</b> The endpoint that wipes a feed is
+  <code>GET&nbsp;/manage/clear/&lt;public_key&gt;/&lt;private_key&gt;</code>. Because
+  it's a GET, any crawler, link-preview bot, or curious viewer that follows a
+  URL containing both keys will erase the data. Never share a URL that includes
+  the private key.
+</div>
+
+<h2 id="fields">4. The allowed measurement fields</h2>
+
+<p>
+  A POST to <code>/data/&lt;public_key&gt;</code> may include any subset of
+  the fields below (plus the required <code>private_key</code>). Unknown
+  fields are ignored; omitted fields are stored as SQL <code>NULL</code>.
+  Numeric fields are numeric-typed in Postgres, so pass numbers not strings.
+  Timestamps are assigned by Bayou when the row is inserted — clients cannot
+  supply their own timestamp, which also means offline data cannot be
+  backfilled.
+</p>
+
+<table>
+  <thead>
+    <tr><th style="width:10.5rem">Field</th><th>Group</th><th>Typical use</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>temperature_c</code></td><td><span class="field-group">env</span></td>
+        <td>Ambient temperature in °C. Default plot parameter for many feeds.</td></tr>
+    <tr><td><code>humidity_rh</code></td><td><span class="field-group">env</span></td>
+        <td>Relative humidity, %.</td></tr>
+    <tr><td><code>pressure_mbar</code></td><td><span class="field-group">env</span></td>
+        <td>Atmospheric pressure, millibars.</td></tr>
+    <tr><td><code>co2_ppm</code></td><td><span class="field-group">env</span></td>
+        <td>CO₂ concentration, ppm. Drives the CO₂ air-changes-per-hour tool.</td></tr>
+    <tr><td><code>light_lux</code></td><td><span class="field-group">env</span></td>
+        <td>Ambient light level, lux.</td></tr>
+    <tr><td><code>distance_meters</code></td><td><span class="field-group">distance</span></td>
+        <td>Primary distance reading. Used by the river-level view and by
+            this repo's ultrasonic kit for water level.</td></tr>
+    <tr><td><code>distance_meters_1</code>,<br>
+            <code>distance_meters_2</code>,<br>
+            <code>distance_meters_3</code></td>
+        <td><span class="field-group">distance</span></td>
+        <td>Extra distance channels when one node reads several distance
+            sensors.</td></tr>
+    <tr><td><code>temperature_c_1</code>,<br>
+            <code>temperature_c_2</code>,<br>
+            <code>temperature_c_3</code></td>
+        <td><span class="field-group">env</span></td>
+        <td>Extra temperature channels — e.g. probes at different depths, or
+            enclosure vs. ambient.</td></tr>
+    <tr><td><code>battery_volts</code></td><td><span class="field-group">power</span></td>
+        <td>Sensor node's battery voltage, useful for health monitoring.</td></tr>
+    <tr><td><code>voltage_1</code>,<br>
+            <code>voltage_2</code>,<br>
+            <code>voltage_3</code></td>
+        <td><span class="field-group">power</span></td>
+        <td>Extra voltage channels — solar panel, load bus, secondary
+            battery.</td></tr>
+    <tr><td><code>gps_lat</code>,<br>
+            <code>gps_lon</code>,<br>
+            <code>gps_alt</code></td>
+        <td><span class="field-group">gps</span></td>
+        <td>Location. Used by the <code>/data/&lt;pubkey&gt;/map/</code> view
+            to plot fixes on Leaflet.</td></tr>
+    <tr><td><code>aux_1</code>,<br>
+            <code>aux_2</code>,<br>
+            <code>aux_3</code></td>
+        <td><span class="field-group">generic</span></td>
+        <td>Generic numeric channels for anything without a dedicated column.
+            The receiver in this repo uses <code>aux_1</code> / <code>aux_2</code>
+            to record measured and claimed LoRa hop counts.</td></tr>
+    <tr><td><code>node_id</code></td><td><span class="field-group">radio</span></td>
+        <td>Distinguishes multiple sensors sharing one feed. The feed page
+            draws one line per node, and most read endpoints have
+            <code>/…/&lt;node_id&gt;</code> variants for per-node views.</td></tr>
+    <tr><td><code>rssi</code>,<br>
+            <code>next_hop</code>,<br>
+            <code>next_rssi</code></td>
+        <td><span class="field-group">radio</span></td>
+        <td>Mesh-radio diagnostics. Used by the gridsquare / signal-map view.</td></tr>
+    <tr><td><code>log</code></td><td><span class="field-group">text</span></td>
+        <td>Short free-form text (VARCHAR-sized). Useful for structured but
+            column-less metadata — e.g. <code>path=5a.91 route=DIRECT</code>.</td></tr>
+  </tbody>
+</table>
+
+<p>
+  If none of the recognized fields fits, use <code>aux_1</code>–<code>aux_3</code>
+  or <code>log</code>. Adding a genuinely new column is possible but touches
+  three files in the Bayou codebase (the SQL schema, the INSERT statement, and
+  <code>restructureJSON</code> in <code>controllers/dataControllers.js</code>).
+</p>
+
+<h2 id="python">5. A Python script that mimics the sensor</h2>
+
+<p>
+  The script <a href="example_temp_poster.py"><code>example_temp_poster.py</code></a>
+  next to this page does exactly what the receiver does — build a small JSON
+  object with the private key plus a measurement field, and POST it to Bayou
+  every few seconds. The only difference is that instead of pulling a real
+  distance from a LoRa DM, it generates a random temperature.
+</p>
+
+<p>The heart of the script:</p>
+
+<pre><code>URL = f"https://bayou.pvos.org/data/{PUBLIC_KEY}"
+
+while True:
+    payload = {
+        "private_key":   PRIVATE_KEY,
+        "node_id":       1,
+        "temperature_c": round(random.uniform(15.0, 25.0), 2),
+    }
+    r = requests.post(URL, json=payload, timeout=10)
+    print(payload["temperature_c"], "->", r.status_code, r.text.strip())
+    time.sleep(10)</code></pre>
+
+<p>
+  You can swap <code>temperature_c</code> for any recognized field in
+  section&nbsp;4, or include several at once — everything Bayou recognizes
+  in one POST lands on the same measurement row.
+</p>
+
+<h2 id="walkthrough">6. End-to-end walkthrough</h2>
+
+<ol>
+  <li>
+    <b>Create a feed.</b> Open
+    <a href="https://bayou.pvos.org/">https://bayou.pvos.org/</a> and click to
+    create a feed. Copy the public key and (especially) the private key from
+    the page it hands back.
+  </li>
+  <li>
+    <b>Point the poster at your feed.</b> Open
+    <code>example_temp_poster.py</code> in a text editor and paste the two
+    keys into <code>PUBLIC_KEY</code> and <code>PRIVATE_KEY</code>.
+  </li>
+  <li>
+    <b>Run the poster.</b>
+    <pre><code>pip install requests   # first time only
+python3 example_temp_poster.py</code></pre>
+    You should see one line per POST: <code>temperature_c=21.4 -&gt; 200 Measurement recorded</code>.
+  </li>
+  <li>
+    <b>Watch the chart.</b> Open, in a browser:
+    <pre><code>https://bayou.pvos.org/data/&lt;YOUR_PUBLIC_KEY&gt;/?plot_param=temperature_c</code></pre>
+    The chart refreshes every few seconds. Each POST from the script should
+    add another point.
+  </li>
+  <li>
+    <b>Explore the read side.</b> Try the JSON, CSV, and latest endpoints:
+    <pre><code>curl "https://bayou.pvos.org/data/&lt;PUBKEY&gt;/latest/"
+curl "https://bayou.pvos.org/data/&lt;PUBKEY&gt;/json/?limit=20"
+curl -O "https://bayou.pvos.org/data/&lt;PUBKEY&gt;/csv/"</code></pre>
+    The JSON response always includes <i>every</i> recognized field,
+    with <code>null</code> for fields you never posted — that's how the
+    feed page can plot any parameter without knowing in advance which
+    ones you actually populate.
+  </li>
+  <li>
+    <b>Swap in the real hardware (optional).</b> Flash the ultrasonic kit
+    from this repo, point the receiver at your feed with
+    <code>set bayou_public_key &lt;your&nbsp;pubkey&gt;</code> /
+    <code>set bayou_private_key &lt;your&nbsp;privkey&gt;</code>, and pair it
+    with the Rook sender. From Bayou's point of view the microcontroller
+    and the Python script are indistinguishable: same URL, same JSON body
+    shape, different measurement field.
+  </li>
+</ol>
+
+<h2 id="gotchas">7. Gotchas &amp; things Bayou does not do</h2>
+
+<ul>
+  <li>
+    <b>No client-supplied timestamps.</b> Every measurement is stamped
+    with the server's <code>NOW()</code> when the row is inserted. There is
+    no way to backfill offline data — a queue-and-flush strategy will end up
+    with all queued readings sharing the flush time.
+  </li>
+  <li>
+    <b>No time-range queries.</b> Read endpoints paginate by <code>limit</code>
+    (newest N rows), not by time. The CSV endpoint always returns every row
+    for the feed. Filtering by time has to happen on the client.
+  </li>
+  <li>
+    <b>Unknown fields are silently dropped.</b> A typo like
+    <code>tempeature_c</code> won't error — it just posts a row with every
+    real field <code>NULL</code>. If a value seems missing, print the payload
+    you sent and confirm the field name matches the table in section&nbsp;4.
+  </li>
+  <li>
+    <b>Type validation is loose.</b> Server-side numeric validation is
+    disabled; a non-numeric value passed for a numeric column will either
+    coerce oddly or trigger a Postgres error surfaced as a 400.
+  </li>
+  <li>
+    <b>The clear-feed endpoint is destructive on GET.</b> Never put the
+    private key in a URL, and don't publish a URL of the form
+    <code>/manage/clear/&lt;pub&gt;/&lt;priv&gt;</code> anywhere a crawler
+    might follow it.
+  </li>
+</ul>
+
+<footer>
+  <p>
+    Firmware source: <code>examples/v3-ultrasonic/companion_sensor_receiver/main.cpp</code>
+    in this repo (<code>postToBayou()</code>). Bayou API reference:
+    <a href="https://github.com/edgecollective/bayou/blob/main/docs/API.md">
+    docs/API.md</a> in the Bayou repo. Feed at
+    <a href="https://bayou.pvos.org/">bayou.pvos.org</a>.
+  </p>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MeshCore — simple sensor kit (edgecollective fork)</title>
+<style>
+  :root {
+    --fg:       #1a1a1a;
+    --fg-muted: #555;
+    --bg:       #fdfdfd;
+    --bg-alt:   #f4f4f6;
+    --accent:   #1857b8;
+    --border:   #d8d8dd;
+    --card-bg:  #fff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg:       #ececec;
+      --fg-muted: #a0a0a8;
+      --bg:       #16171a;
+      --bg-alt:   #21232a;
+      --accent:   #7ba9ff;
+      --border:   #33353d;
+      --card-bg:  #21232a;
+    }
+  }
+  html { background: var(--bg); color: var(--fg); }
+  body {
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, sans-serif;
+    max-width: 780px;
+    margin: 0 auto;
+    padding: 2.5rem 1.25rem 5rem;
+  }
+  h1 { font-size: 1.95rem; margin: 0 0 .35rem; line-height: 1.15; }
+  .lead { color: var(--fg-muted); margin: 0 0 2rem; font-size: 1.03rem; }
+  h2 {
+    font-size: 1.15rem; margin: 2.2rem 0 .75rem;
+    padding-bottom: .2rem; border-bottom: 1px solid var(--border);
+  }
+  a { color: var(--accent); }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: var(--bg-alt); padding: .06em .32em; border-radius: 3px;
+    font-size: .92em;
+  }
+  .cards { display: grid; gap: .85rem; grid-template-columns: 1fr; }
+  @media (min-width: 640px) {
+    .cards { grid-template-columns: 1fr 1fr; }
+  }
+  .card {
+    display: block; text-decoration: none; color: inherit;
+    background: var(--card-bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: .95rem 1.1rem;
+    transition: border-color .12s, transform .12s;
+  }
+  .card:hover { border-color: var(--accent); transform: translateY(-1px); }
+  .card h3 { margin: 0 0 .3rem; font-size: 1.02rem; color: var(--accent); }
+  .card p  { margin: 0; font-size: .93rem; color: var(--fg-muted); }
+  footer {
+    margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border);
+    color: var(--fg-muted); font-size: .88rem;
+  }
+</style>
+</head>
+<body>
+
+<h1>MeshCore — simple sensor kit</h1>
+<p class="lead">
+  Edgecollective's fork of <a href="https://github.com/meshcore-dev/meshcore">MeshCore</a>,
+  focused on a small sensor kit: a Rook (nRF52840) that reads a MaxBotix
+  ultrasonic distance sensor and transmits LoRa messages to a Heltec (ESP32-S3)
+  receiver, which forwards each reading to a <a href="https://bayou.pvos.org/">Bayou</a>
+  feed over WiFi.
+</p>
+
+<h2>Offerings</h2>
+
+<div class="cards">
+
+  <a class="card" href="bayou-tutorial/">
+    <h3>Bayou tutorial →</h3>
+    <p>How the receiver POSTs to Bayou, which fields Bayou recognizes, and
+       a runnable Python script that mimics the sensor.</p>
+  </a>
+
+  <a class="card" href="https://edgecollective.io/micro-config/">
+    <h3>Setup page →</h3>
+    <p>Browser-based flasher and configuration walkthrough for the
+       sender + receiver pair (uses Web Serial in Chrome/Edge).</p>
+  </a>
+
+  <a class="card"
+     href="https://github.com/edgecollective/MeshCore-simple-sensor/tree/main/examples/v3-ultrasonic">
+    <h3>Firmware source →</h3>
+    <p><code>examples/v3-ultrasonic/</code> — the sender and
+       companion-sensor-receiver source that this kit ships.</p>
+  </a>
+
+  <a class="card"
+     href="https://github.com/edgecollective/MeshCore-simple-sensor/tree/main/firmware">
+    <h3>Firmware snapshots →</h3>
+    <p>Dated build snapshots (<code>.uf2</code> / <code>.bin</code>) with
+       README provenance, for reproducing what's currently deployed.</p>
+  </a>
+
+</div>
+
+<h2>About the upstream</h2>
+<p>
+  The bulk of this repository is <a href="https://github.com/meshcore-dev/meshcore">upstream
+  MeshCore</a>, unmodified — its docs, examples, and variants are all
+  still here. The edgecollective-specific additions are the
+  <code>v3-ultrasonic</code> example pair, the <code>Rook</code>
+  variant tuning in <code>variants/rook/</code>, and the dated snapshot
+  directories in <code>firmware/</code>. For general MeshCore
+  documentation see <a href="https://docs.meshcore.io">docs.meshcore.io</a>.
+</p>
+
+<footer>
+  <p>
+    Source: <a href="https://github.com/edgecollective/MeshCore-simple-sensor">
+    github.com/edgecollective/MeshCore-simple-sensor</a>.
+  </p>
+</footer>
+
+</body>
+</html>
